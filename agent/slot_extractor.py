@@ -101,13 +101,14 @@ def _rule_based_check(query: str) -> Optional[SlotResult]:
 # ---------------------------------------------------------------------------
 
 _EXTRACTION_SYSTEM_PROMPT = """\
-You are a slot extraction engine for a Natural Language to SQL system.
+You are an advanced slot extraction engine for a Natural Language to SQL system.
 
 Given a user query and a database schema, extract the following slots:
 - "entity"    : The table the user is asking about (must be from the schema). Null if absent.
 - "attribute" : The column/field being filtered or selected. Null if absent.
 - "condition" : The filter expression (e.g. "< 2000", "= 'Bangalore'"). Null if absent or incomplete.
-- "operation" : SQL operation implied ("SELECT", "COUNT", "SUM", etc.). Default "SELECT".
+- "operation" : SQL operation implied ("SELECT", "COUNT", "SUM", "AVG", etc.). Default "SELECT".
+- "confidence": float between 0.0 and 1.0 indicating confidence in the extraction.
 
 Rules:
 1. Only use table names and column names that actually exist in the schema.
