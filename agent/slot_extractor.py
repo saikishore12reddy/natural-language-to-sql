@@ -110,16 +110,48 @@ Given a user query and a database schema, extract the following slots:
 - "operation" : SQL operation implied ("SELECT", "COUNT", "SUM", "AVG", etc.). Default "SELECT".
 - "confidence": float between 0.0 and 1.0 indicating confidence in the extraction.
 
-Rules:
-1. Only use table names and column names that actually exist in the schema.
-2. If the entity is not mentioned AND cannot be inferred, set entity to null.
-3. If only a condition is mentioned (e.g. "less than 2000") but no entity or attribute, set both to null.
-4. After extracting, compute:
-   - "status": "complete" if entity is non-null AND (attribute is non-null OR no filter is needed), else "incomplete".
-   - "missing": list of slot names that are null but required. Always include "entity" if null;
-     include "attribute" if a filter/comparison is implied but attribute is null.
+Rules for Schema Matching:
+1. ONLY use table names and column names that actually exist in the provided schema.
+2. If the user mentions a synonym or alternative term (e.g., "client" for "customer"), map it to the closest matching schema entity.
+3. For entity inference, consider:
+   - Direct mentions: "show me customers" -> entity="customers"
+   - Implicit queries: "all loans over 1000" -> entity="loans" (inferred from context)
+   - Aggregations: "total amount" might need entity from context
+4. For attribute inference:
+   - "show me the amount" -> attribute="amount" (if unique across tables)
+   - "how many" -> attribute is not needed (implies COUNT(*))
+   - "the city" -> attribute="city"
+5. A query is "complete" if:
+   - Entity is identified (non-null) AND
+   - Either: no filtering attribute needed (e.g., "list all customers") OR
+   - Attribute is identified when a filter/comparison is present OR
+   - Operation is an aggregation that doesn't require a specific attribute
 
-Return ONLY a JSON object with keys: entity, attribute, condition, operation, status, missing.
+Missing Slot Rules:
+- Always include "entity" in missing if entity is null or low confidence (<0.6)
+- Include "attribute" in missing if: (a) attribute is null AND (b) the query contains comparison words (>, <, =, greater, less, more, than, equal) or filter words (where, with, having)
+- Include "condition" in missing if: condition is null AND query contains comparisons or "specific value" phrases
+
+Return ONLY a JSON object with these exact keys:
+{
+  "entity": string or null,
+  "attribute": string or null,
+  "condition": string or null,
+  "operation": string,
+  "confidence": float,
+  "status": "complete" or "incomplete",
+  "missing": ["entity", "attribute", "condition"]  // subset of these
+}
+
+Examples:
+Query: "show me customers" with schema having table "customers"
+-> {"entity": "customers", "attribute": null, "condition": null, "operation": "SELECT", "confidence": 0.95, "status": "complete", "missing": []}
+
+Query: "amount greater than 1000" with schema having tables "loans" (with amount) and "payments" (with amount)
+-> {"entity": null, "attribute": "amount", "condition": "> 1000", "operation": "SELECT", "confidence": 0.3, "status": "incomplete", "missing": ["entity"]}
+
+Query: "how many people in Bangalore" with schema having tables "customers" (name, city), "employees" (name, city)
+-> {"entity": "customers", "attribute": null, "condition": "city = 'Bangalore'", "operation": "COUNT", "confidence": 0.8, "status": "complete", "missing": []}
 """
 
 
