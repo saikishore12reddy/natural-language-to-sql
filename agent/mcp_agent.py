@@ -1,4 +1,6 @@
+import sys
 import json
+import os
 from typing import Dict, Any, List, Optional
 import asyncio
 import contextlib
@@ -15,9 +17,11 @@ logger = logging.getLogger(__name__)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# We start the server using the virtual environment python
-# to ensure it has all dependencies correctly resolved
-SERVER_COMMAND = ["python", "-m", "mcp_server.server"]
+# We start the server using the same python interpreter
+SERVER_COMMAND = [sys.executable, "-m", "mcp_server.server"]
+
+SCHEMA_FILTER_ENABLED = os.getenv("SCHEMA_FILTER_ENABLED", "true").lower() != "false"
+MAX_SCHEMA_CANDIDATES = int(os.getenv("MAX_SCHEMA_CANDIDATES", "8"))
 
 class MCPAgent:
     def __init__(self, api_key: str = None):
@@ -26,7 +30,7 @@ class MCPAgent:
             base_url="https://api.groq.com/openai/v1"
         )
         self.server_params = StdioServerParameters(
-            command="python",
+            command=sys.executable,
             args=["-m", "mcp_server.server"],
             # Important: pass the current environment to ensure python paths
             env=None
@@ -53,7 +57,7 @@ class MCPAgent:
     async def analyze_intent(self, query: str, table_names: List[str]) -> Dict[str, Any]:
         """
         Analyzes the user query to detect intent, confidence, and entities.
-        Includes table names in context to improve scope detection.
+        Includes relevant table names in context (filtered by query if enabled) to improve scope detection.
         """
         system_prompt = (
             "Analyze the following user query for an NL2SQL system. "
@@ -83,23 +87,43 @@ class MCPAgent:
             logger.error(f"Error parsing intent analysis: {e}")
             return {"intent": "unknown", "confidence": 0.0, "entities": {}, "is_multi_intent": False, "needs_clarification": True, "rewritten_query": query}
 
-    async def get_table_names(self) -> List[str]:
-        """Fetches table names from the MCP server."""
-        if not self._session:
-            await self.connect()
-        schema_result = await self._session.call_tool("get_schema", arguments={})
-        schema_text = "".join([c.text for c in schema_result.content if hasattr(c, 'text')])
-        return [line.split("Table: ")[1].strip() for line in schema_text.split("\n") if line.startswith("Table: ")]
+    async def get_table_names(self, query: Optional[str] = None) -> List[str]:
+        """
+        Fetches table names from the MCP server.
 
-    async def get_schema_dict(self) -> Dict[str, List[str]]:
+        Args:
+            query: Optional. If provided and SCHEMA_FILTER_ENABLED, returns filtered table names.
+        """
+        schema_dict = await self.get_schema_dict(query)
+        return list(schema_dict.keys())
+
+    async def get_schema_dict(self, query: Optional[str] = None) -> Dict[str, List[str]]:
         """
         Returns the database schema as {table_name: [col1, col2, ...]}.
         Used by SlotExtractor and ClarificationEngine for schema-aware processing.
+
+        Args:
+            query: Optional. If provided and SCHEMA_FILTER_ENABLED, uses filtered schema.
         """
         if not self._session:
             await self.connect()
-        schema_result = await self._session.call_tool("get_schema", arguments={})
+
+        # Decide whether to use filtering
+        if query and SCHEMA_FILTER_ENABLED:
+            # Use filtered schema MCP tool
+            schema_result = await self._session.call_tool(
+                "get_filtered_schema",
+                arguments={"query": query, "max_candidates": MAX_SCHEMA_CANDIDATES}
+            )
+            tool_used = "get_filtered_schema"
+        else:
+            # Fallback to full schema
+            schema_result = await self._session.call_tool("get_schema", arguments={})
+            tool_used = "get_schema"
+
         schema_text = "".join([c.text for c in schema_result.content if hasattr(c, 'text')])
+
+        logger.debug("Fetched schema using %s (query=%r)", tool_used, query or "")
 
         schema_dict: Dict[str, List[str]] = {}
         current_table: Optional[str] = None

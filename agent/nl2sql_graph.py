@@ -1,5 +1,6 @@
 import json
 import logging
+import difflib
 from typing import Any, Dict, List, Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
@@ -29,27 +30,107 @@ class NL2SQLState(TypedDict):
 # Nodes
 # ---------------------------------------------------------------------------
 
-async def fetch_schema_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
-    """Node: Fetch dynamic schema context from MCP."""
+async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
+    """Node: Early rejection of queries with no schema-related keywords."""
     agent = config["configurable"]["agent"]
-    schema_dict = await agent.get_schema_dict()
+    query = state["query"].strip()
+    logger.info(f"[validate_query] Checking if query has schema-related keywords: '{query}'")
+
+    # Step 1: Remove stop words and check for remaining meaningful content
+    stop_words = {"a", "an", "the", "me", "all", "show", "list", "get", "find", "display", "tell", "about", "of", "in", "on", "at", "to", "for", "and", "or", "with", "without", "from", "by", "using", "i", "you", "we", "they", "it", "this", "that", "these", "those", "my", "your", "our", "their", "his", "her", "its", "some", "any", "every", "each", "which", "what", "where", "when", "how", "why", "who", "please", "just", "now", "today", "yesterday", "tomorrow"}
+
+    meaningful_words = [w.lower() for w in query.lower().split() if w.lower() not in stop_words]
+
+    if not meaningful_words:
+        logger.warning("[validate_query] Query contains only stop words - rejecting without schema fetch")
+        return {
+            "final_response": {
+                "type": "clarification",
+                "message": "Your query is too vague. Please mention a specific table name or be more descriptive. (e.g., 'show customers', 'list orders')",
+                "options": [],
+                "intent_analysis": {"confidence": 0.0}
+            }
+        }
+
+    # Step 2: Now fetch filtered table names using the query (only relevant tables)
+    table_names = await agent.get_table_names(query=query)
+    logger.info(f"[validate_query] Filtered tables from schema: {table_names}")
+
+    # If no tables are found at all, that's an error (DB has no tables or query too far from any table)
+    if not table_names:
+        logger.error("[validate_query] Database has no tables or filtered schema returned empty!")
+        return {
+            "final_response": {
+                "type": "error",
+                "message": "Database schema is empty or inaccessible. Please check database connection."
+            }
+        }
+
+    # Step 3: Check if any meaningful query word matches or is close to a table name
+    lower_tables = [t.lower() for t in table_names]
+    matched_tables = []
+
+    # Try exact match first (case-insensitive)
+    for word in meaningful_words:
+        if word in lower_tables:
+            matched_tables.append(word)
+
+    # If no exact match, try fuzzy matching with a high cutoff (0.75)
+    if not matched_tables:
+        for word in meaningful_words:
+            # Skip words shorter than 3 characters
+            if len(word) < 3:
+                continue
+            close_matches = difflib.get_close_matches(word, lower_tables, n=1, cutoff=0.75)
+            if close_matches:
+                matched_tables.append(close_matches[0])
+
+    if not matched_tables:
+        logger.warning(f"[validate_query] No table references found. Words: {meaningful_words}, Filtered tables: {table_names}")
+        return {
+            "final_response": {
+                "type": "clarification",
+                "message": f"I couldn't identify which table you're referring to. Available tables: {', '.join(table_names)}. Please mention a specific table name.",
+                "options": [],
+                "intent_analysis": {"confidence": 0.0}
+            }
+        }
+
+    logger.info(f"[validate_query] Matched tables: {matched_tables}")
+    return {"final_response": None}  # Continue to schema fetch
+
+
+async def fetch_schema_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
+    """Node: Fetch dynamic schema context from MCP, filtered to relevant tables."""
+    agent = config["configurable"]["agent"]
+    query = state["query"]
+    logger.info(f"[fetch_schema] Fetching schema for query: '{query}'")
+    schema_dict = await agent.get_schema_dict(query=query)
+    table_names = list(schema_dict.keys())
+    logger.info(f"[fetch_schema] Fetched {len(table_names)} tables: {table_names}")
     return {
         "schema_dict": schema_dict,
-        "table_names": list(schema_dict.keys())
+        "table_names": table_names
     }
 
 async def extract_slots_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
     """Node: Extract slots and detect structural incompleteness."""
     agent = config["configurable"]["agent"]
-    slot_result = await agent._slot_extractor.extract(state["query"], state["schema_dict"])
+    query = state["query"]
+    logger.info(f"[extract_slots] Extracting slots for query: '{query}'")
+    slot_result = await agent._slot_extractor.extract(query, state["schema_dict"])
+    logger.info(f"[extract_slots] Slot extraction complete. is_incomplete={slot_result.is_incomplete()}")
     return {"slot_result": slot_result}
 
 async def clarify_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
     """Node: Generate clarification for incomplete queries."""
     agent = config["configurable"]["agent"]
+    query = state["query"]
+    logger.info(f"[clarify] Generating clarification for query: '{query}'")
     response = await agent._clarification_engine.generate(
-        state["query"], state["slot_result"], state["schema_dict"]
+        query, state["slot_result"], state["schema_dict"]
     )
+    logger.info(f"[clarify] Clarification response type: {response.get('type')}")
     return {"final_response": response}
 
 async def analyze_intent_node(state: NL2SQLState, config: RunnableConfig) -> Dict[str, Any]:
@@ -215,6 +296,14 @@ def route_after_slots(state: NL2SQLState) -> str:
         return "clarify"
     return "analyze_intent"
 
+
+def route_after_validate(state: NL2SQLState) -> str:
+    """Route after early query validation."""
+    # If final_response is set by validate_query_node, exit early
+    if state.get("final_response"):
+        return END
+    return "fetch_schema"
+
 def route_after_intent(state: NL2SQLState) -> str:
     """Route based on intent confidence and clarity."""
     intent = state["intent_analysis"]
@@ -236,6 +325,7 @@ def create_nl2sql_graph():
     workflow = StateGraph(NL2SQLState)
 
     # Add Nodes
+    workflow.add_node("validate_query", validate_query_node)
     workflow.add_node("fetch_schema", fetch_schema_node)
     workflow.add_node("extract_slots", extract_slots_node)
     workflow.add_node("analyze_intent", analyze_intent_node)
@@ -244,7 +334,17 @@ def create_nl2sql_graph():
     workflow.add_node("generate_sql", generate_sql_node)
 
     # Build Edges
-    workflow.add_edge(START, "fetch_schema")
+    workflow.add_edge(START, "validate_query")
+
+    workflow.add_conditional_edges(
+        "validate_query",
+        route_after_validate,
+        {
+            "fetch_schema": "fetch_schema",
+            END: END
+        }
+    )
+
     workflow.add_edge("fetch_schema", "extract_slots")
     
     workflow.add_conditional_edges(

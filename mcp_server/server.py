@@ -4,7 +4,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 from core.database import execute_safe_sql, seed_table
-from core.schema_inspector import get_schema_metadata
+from core.schema_inspector import get_schema_metadata, get_filtered_schema_metadata
 
 # Initialize FastMCP Server
 mcp = FastMCP("NL-to-SQL-Server")
@@ -16,6 +16,16 @@ def get_schema() -> str:
     Useful for LLM to understand the dynamic database schema.
     """
     return get_schema_metadata()
+
+
+@mcp.tool()
+def get_filtered_schema(query: str, max_candidates: int = 8) -> str:
+    """
+    Returns filtered schema metadata for only the tables relevant to the query.
+    Includes FK-related tables to preserve join context.
+    Useful for reducing LLM context when working with large databases.
+    """
+    return get_filtered_schema_metadata(query, max_candidates=max_candidates)
 
 @mcp.tool()
 def execute_sql(query: str) -> str:

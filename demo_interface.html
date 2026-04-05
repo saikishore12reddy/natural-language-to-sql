@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NL2SQL Clarification Demo</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 40px auto; padding: 20px; background: #f4f7f6; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        h1 { color: #2c3e50; margin-top: 0; }
+        .input-group { display: flex; gap: 10px; margin-bottom: 20px; }
+        input[type="text"] { flex-grow: 1; padding: 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
+        button { padding: 12px 24px; background: #3498db; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; transition: background 0.3s; }
+        button:hover { background: #2980b9; }
+        .clarification { background: #fff3cd; border-left: 5px solid #ffecb5; padding: 20px; border-radius: 4px; margin: 20px 0; display: none; }
+        .options { margin-top: 15px; display: flex; flex-direction: column; gap: 8px; }
+        .option-btn { background: #e9ecef; border: 1px solid #dee2e6; text-align: left; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: 0.2s; }
+        .option-btn:hover { background: #dee2e6; }
+        #result { margin-top: 20px; white-space: pre-wrap; font-family: monospace; background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 6px; display: none; }
+        .loader { display: none; margin-left: 10px; border: 3px solid #f3f3f3; border-top: 3px solid #3498db; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>NL2SQL Query Interface</h1>
+        <p>Type a natural language query for your database (try "Show").</p>
+        
+        <div class="input-group">
+            <input type="text" id="queryInput" placeholder="e.g., Show me Bangalore customers" value="Show">
+            <button onclick="submitQuery()">Query <span id="loader" class="loader"></span></button>
+        </div>
+
+        <div id="clarificationBox" class="clarification">
+            <strong id="clarificationMsg">Checking...</strong>
+            <div id="optionsList" class="options"></div>
+        </div>
+
+        <div id="result"></div>
+    </div>
+
+    <script>
+        async function submitQuery(queryOverride = null) {
+            const query = queryOverride || document.getElementById('queryInput').value;
+            if (!query) return;
+
+            // UI state
+            document.getElementById('loader').style.display = 'inline-block';
+            document.getElementById('clarificationBox').style.display = 'none';
+            document.getElementById('result').style.display = 'none';
+
+            try {
+                const response = await fetch('http://localhost:8000/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query })
+                });
+                const data = await response.json();
+
+                if (data.type === 'clarification') {
+                    handleClarification(data);
+                } else {
+                    handleSuccess(data);
+                }
+            } catch (err) {
+                alert('Connection error: Make sure FastAPI is running on port 8000');
+            } finally {
+                document.getElementById('loader').style.display = 'none';
+            }
+        }
+
+        function handleClarification(data) {
+            document.getElementById('clarificationMsg').innerText = data.message;
+            const optionsList = document.getElementById('optionsList');
+            optionsList.innerHTML = '';
+            
+            data.options.forEach(opt => {
+                const btn = document.createElement('button');
+                btn.className = 'option-btn';
+                btn.innerText = opt;
+                btn.onclick = () => submitQuery(opt);
+                optionsList.appendChild(btn);
+            });
+
+            document.getElementById('clarificationBox').style.display = 'block';
+        }
+
+        function handleSuccess(data) {
+            const res = document.getElementById('result');
+            res.innerText = JSON.stringify(data, null, 2);
+            res.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
