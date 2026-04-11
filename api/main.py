@@ -6,6 +6,7 @@ from agent.mcp_agent import MCPAgent
 import os
 from dotenv import load_dotenv
 import logging
+import uuid
 
 load_dotenv()
 
@@ -28,6 +29,8 @@ api_key = os.getenv("GROQ_API_KEY")
 
 class QueryRequest(BaseModel):
     query: str
+    session_id: Optional[str] = None
+    conversation_history: Optional[List[Dict[str, str]]] = None
 
 class QueryResponse(BaseModel):
     type: str  # success, clarification, error
@@ -43,20 +46,26 @@ class QueryResponse(BaseModel):
     slot_analysis: Optional[Dict[str, Any]] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     intent_analysis: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    conversation_history: Optional[List[Dict[str, str]]] = None
 
 @app.post("/query", response_model=QueryResponse)
 async def process_natural_language_query(request: QueryRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-    logger.info(f"Received query: {request.query}")
-    
+
+    logger.info(f"Received query: {request.query} (session: {request.session_id})")
+
     agent = MCPAgent(api_key=api_key)
-    
+
     try:
-        result = await agent.process_query(request.query)
-        
-        return QueryResponse(
+        result = await agent.process_query(
+            request.query,
+            conversation_history=request.conversation_history,
+            session_id=request.session_id
+        )
+
+        response = QueryResponse(
             type=result.get("type", "success"),
             query=request.query,
             sql=result.get("sql_executed"),
@@ -69,9 +78,13 @@ async def process_natural_language_query(request: QueryRequest):
             missing_slots=result.get("missing"),
             slot_analysis=result.get("slot_analysis"),
             tool_calls=result.get("tool_calls"),
-            intent_analysis=result.get("intent_analysis")
+            intent_analysis=result.get("intent_analysis"),
+            session_id=result.get("session_id"),
+            conversation_history=result.get("conversation_history")
         )
-        
+
+        return response
+
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

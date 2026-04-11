@@ -25,6 +25,8 @@ class NL2SQLState(TypedDict):
     final_response: Optional[Dict[str, Any]]
     messages: List[Dict[str, str]]
     tool_results: List[Dict[str, Any]]
+    conversation_history: List[Dict[str, str]]  # NEW: History context for disambiguation
+    session_id: Optional[str]  # NEW: Session identifier
 
 # ---------------------------------------------------------------------------
 # Nodes
@@ -34,6 +36,7 @@ async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dic
     """Node: Early rejection of queries with no schema-related keywords."""
     agent = config["configurable"]["agent"]
     query = state["query"].strip()
+    conversation_history = state.get("conversation_history", [])
     logger.info(f"[validate_query] Checking if query has schema-related keywords: '{query}'")
 
     # Step 1: Remove stop words and check for remaining meaningful content
@@ -52,8 +55,29 @@ async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dic
             }
         }
 
-    # Step 2: Now fetch filtered table names using the query (only relevant tables)
-    table_names = await agent.get_table_names(query=query)
+    # Step 2: Extract table names from conversation history for context enhancement
+    historical_tables = []
+    if conversation_history:
+        for turn in reversed(conversation_history):
+            if turn.get("role") == "assistant":
+                tables = turn.get("tables", [])
+                historical_tables.extend(tables)
+            if len(historical_tables) >= 2:
+                break
+
+    # Remove duplicates while preserving order
+    historical_tables = list(dict.fromkeys(historical_tables))
+
+    # Step 3: Now fetch filtered table names using the query (only relevant tables)
+    # Enhance query with historical table context for better detection
+    enhanced_query = query
+    if historical_tables:
+        # Prepend historical context to help with table detection
+        hist_context = " ".join(historical_tables)
+        enhanced_query = f"{hist_context} {query}"
+        logger.debug(f"[validate_query] Enhanced query with historical tables: '{enhanced_query}'")
+
+    table_names = await agent.get_table_names(query=enhanced_query)
     logger.info(f"[validate_query] Filtered tables from schema: {table_names}")
 
     # If no tables are found at all, that's an error (DB has no tables or query too far from any table)
@@ -66,7 +90,8 @@ async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dic
             }
         }
 
-    # Step 3: Check if any meaningful query word matches or is close to a table name
+    # Step 4: Check if any meaningful query word matches or is close to a table name
+    # Also allow historical tables as candidates for follow-up queries
     lower_tables = [t.lower() for t in table_names]
     matched_tables = []
 
@@ -75,7 +100,14 @@ async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dic
         if word in lower_tables:
             matched_tables.append(word)
 
-    # If no exact match, try fuzzy matching with a high cutoff (0.75)
+    # If no exact match from current query, try historical tables
+    if not matched_tables and historical_tables:
+        lower_historical = [t.lower() for t in historical_tables]
+        for word in meaningful_words:
+            if word in lower_historical:
+                matched_tables.append(word)
+
+    # If still no match, try fuzzy matching with a high cutoff (0.75)
     if not matched_tables:
         for word in meaningful_words:
             # Skip words shorter than 3 characters
@@ -85,8 +117,14 @@ async def validate_query_node(state: NL2SQLState, config: RunnableConfig) -> Dic
             if close_matches:
                 matched_tables.append(close_matches[0])
 
+    # Final fallback: if still no matches but we have historical tables, use the most recent one
+    # This handles cases like "only from Mumbai" where the query lacks explicit table references
+    if not matched_tables and historical_tables:
+        logger.info(f"[validate_query] No direct matches found, using historical table: {historical_tables[0]}")
+        matched_tables = [historical_tables[0].lower()]
+
     if not matched_tables:
-        logger.warning(f"[validate_query] No table references found. Words: {meaningful_words}, Filtered tables: {table_names}")
+        logger.warning(f"[validate_query] No table references found. Words: {meaningful_words}, Filtered tables: {table_names}, Historical tables: {historical_tables}")
         return {
             "final_response": {
                 "type": "clarification",
@@ -375,10 +413,12 @@ def create_nl2sql_graph():
 # Entry Point
 # ---------------------------------------------------------------------------
 
-async def run_nl2sql_graph(query: str, agent: Any) -> Dict[str, Any]:
+async def run_nl2sql_graph(query: str, agent: Any,
+                         conversation_history: Optional[List[Dict[str, str]]] = None,
+                         session_id: Optional[str] = None) -> Dict[str, Any]:
     """Runs the compiled graph for a given query and agent instance."""
     graph = create_nl2sql_graph()
-    
+
     initial_state = {
         "query": query,
         "schema_dict": {},
@@ -387,12 +427,16 @@ async def run_nl2sql_graph(query: str, agent: Any) -> Dict[str, Any]:
         "intent_analysis": None,
         "final_response": None,
         "messages": [],
-        "tool_results": []
+        "tool_results": [],
+        "conversation_history": conversation_history or [],
+        "session_id": session_id
     }
-    
+
     final_state = await graph.ainvoke(
-        initial_state, 
-        config={"configurable": {"agent": agent}}
+        initial_state,
+        config={"configurable": {"agent": agent,
+                               "conversation_history": conversation_history or [],
+                               "session_id": session_id}}
     )
-    
+
     return final_state["final_response"]
